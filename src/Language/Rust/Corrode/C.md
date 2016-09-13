@@ -1549,7 +1549,16 @@ interpretStatement (CWhile c b False _) = do
     (b', _) <- loopScope
         (Rust.Break Nothing) (Rust.Continue Nothing)
         (interpretStatement b)
-    return [Rust.Stmt (Rust.While Nothing (toBool c') (statementsToBlock b'))]
+    return [Rust.Stmt (while Nothing (toBool c') (statementsToBlock b'))]
+    where
+```
+
+The following function is a smart constructor for `while` loops
+that turns `while true` into `loop`.
+
+```haskell
+        while lt (Rust.Lit (Rust.LitRep "true")) = Rust.Loop lt
+        while lt cond = Rust.While lt cond
 ```
 
 `do ... while` loops are a little harder to translate because Rust doesn't have a direct equivalent.
@@ -1602,14 +1611,24 @@ interpretStatement (CWhile c b True _) = do
             else b'
 
     c' <- interpretExpr True c
-    let loopTest = Rust.Stmt $ Rust.IfThenElse
+    let loopTest = ifThenElse
             (toNotBool c')
-            (statementsToBlock [Rust.Stmt (Rust.Break Nothing)])
-            (statementsToBlock [])
+            [Rust.Stmt (Rust.Break Nothing)]
+            []
 
     let outerLabel = if sawBreak then breakTo else Nothing
-    let outer = Rust.Loop outerLabel (statementsToBlock (inner ++ [loopTest]))
+    let outer = Rust.Loop outerLabel (statementsToBlock (inner ++ loopTest))
     return [Rust.Stmt outer]
+    where
+```
+
+The following function is smart constructor for `if` statements,
+throwing away the dead branch if the condition is `true` or `false`.
+
+```haskell
+        ifThenElse (Rust.Lit (Rust.LitRep "true")) ifTrue _ = ifTrue
+        ifThenElse (Rust.Lit (Rust.LitRep "false")) _ ifFalse = ifFalse
+        ifThenElse cond t e = [Rust.Stmt (Rust.IfThenElse cond (Rust.Block t Nothing) (Rust.Block e Nothing))]
 ```
 
 C's `for` loops can be tricky to translate to Rust, which doesn't have
