@@ -2519,6 +2519,14 @@ out how to turn the arbitrary scalar expression we have into a `bool`.
 
 ```haskell
 toBool :: Result -> Rust.Expr
+toBool (Result { result = Rust.Lit (Rust.LitRep lit) })
+```
+
+As a special case, the constants 0 and 1 are translated to `false` and `true`, respectively.
+
+```haskell
+    | lit == "0i32" = Rust.Lit (Rust.LitRep "false")
+    | lit == "1i32" = Rust.Lit (Rust.LitRep "true")
 toBool (Result { resultType = t, result = v }) = case t of
 ```
 
@@ -2551,6 +2559,14 @@ possible.
 
 ```haskell
 toNotBool :: Result -> Rust.Expr
+toNotBool (Result { result = Rust.Lit (Rust.LitRep lit) })
+```
+
+As a special case, the constants 0 and 1 are negated to `true` and `false`, respectively.
+
+```haskell
+    | lit == "0i32" = Rust.Lit (Rust.LitRep "true")
+    | lit == "1i32" = Rust.Lit (Rust.LitRep "false")
 toNotBool (Result { resultType = t, result = v }) = case t of
     IsBool -> Rust.Not v
     IsPtr _ _ -> Rust.MethodCall v (Rust.VarName "is_null") []
