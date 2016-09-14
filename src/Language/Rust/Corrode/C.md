@@ -1731,6 +1731,173 @@ interpretStatement stmt@(CReturn expr _) = do
     return [Rust.Stmt (Rust.Return expr')]
 ```
 
+`switch` statements are hard to translate in general
+because `case` statements can occur anywhere in its body.
+These arbitrary jumps create the same problem as `goto` statements.
+
+However, `switch` statements are often used like `match` statements in Rust:
+
+```c
+switch (scrutinee) {
+    case 0:
+    case 2:
+        // ... (no switch-related statements)
+        break;
+    case 3 ... 10:
+        // ... (no switch-related statements)
+        return;
+    default:
+        // ... (no switch-related statements)
+        continue; // an enclosing loop
+    case 1:
+        // ... (no switch-related statements)
+}
+```
+
+This is relatively easy to convert to Rust:
+
+```rust
+match scrutinee {
+    0 | 2 => {
+        // ...
+    }
+    3 ... 10 => {
+        // ...
+        return;
+    }
+    1 => {
+        // ...
+    }
+    _ => {
+        // ...
+        continue; // an enclosing loop
+    }
+}
+```
+
+Keep the following things in mind about this translation:
+
+- `break` statements are not needed (nor allowed) in Rust
+- Rust tries the patterns from top to bottom and takes the first one that matches.
+- C jumps to the only matching `case` label directly. The `case`s must not overlap for this reason.
+- Because of this discrepancy, the "catch-all" pattern `_ =>` must be moved to the end in Rust.
+
+We call `switch` statements of the above form *match-like*.
+More precisely, a `switch` statement is *match-like* if and only if
+
+- the switch body is a block and
+- this block contains no declarations
+- this block can be split into consecutive parts called *arms* of the following form:
+- each arm starts with one or more consecutive `case ...:` labels and
+- each arm contains no further `case` labels and
+- each arm ends with a statement exiting the switch body (`break`, `continue` or `return`).
+  There is no "fall-through" since Rust's `match` doesn't support this. Additionally
+- each arm contains no `break` statement at any other location.
+
+Once we have checked that the `switch` statement is match-like,
+it is straightforward to translate it to Rust:
+The `case` labels at the start of an arm become a pattern and the statements of the arm are translated as usual.
+
+> **TODO**: Do we have to do integer promotions? Are type conversions even possible in Rust patterns?
+
+```haskell
+interpretStatement expr@(CSwitch scrutinee (CCompound _ items _) _) =
+    case traverse blockItemToStmt items >>= extractMatchArms of
+        Just arms -> do
+```
+
+First, we have to check whether the `switch` statement is match-like.
+This is what `extractMatchArms` does. It also returns the extracted arms on success.
+After that it is just a matter of translating the statements
+and remembering to move the `_ => ...` pattern to the end of the `match` expression in Rust.
+
+```haskell
+            scrutinee' <- interpretExpr True scrutinee
+            arms' <- traverse translateMatchArm arms
+            return [Rust.Stmt (Rust.Match (result scrutinee') (moveCatchAllToEnd arms'))]
+        Nothing -> noTranslation expr "corrode can only handle \"match-like\" switch statements"
+    where
+        blockItemToStmt :: CBlockItem -> Maybe CStat
+        blockItemToStmt (CBlockStmt s) = Just s
+        blockItemToStmt _ = Nothing
+```
+
+Extracting the match arms is the hardest part.
+We start by collecting all the `case` labels at the start into a pattern.
+Afterwards we scan the following statements for an "exit" statement,
+i.e. `break`, `continue` or `return`.
+Each of those completes an arm (a `break` has to be removed tho, as in the above example).
+We iterate this procedure until we have processed all statements in the block.
+
+```haskell
+        extractMatchArms :: [CStat] -> Maybe [([Rust.SimplePattern CExpr], [CStat])]
+        extractMatchArms [] = Just []
+        extractMatchArms (stmt:rest) = do
+            let (pats, s) = extractPatterns stmt
+            guard (not (null pats))
+            let (arm, next) = splitAtNextSwitchExit (s:rest)
+            arms <- extractMatchArms next
+            return ((pats, arm):arms)
+
+        extractPatterns :: CStat -> ([Rust.SimplePattern CExpr], CStat)
+        extractPatterns stmt = case stmt of
+            CCase e s _ -> recur (Rust.PatExpr e) s
+            CCases e1 e2 s _ -> recur (Rust.PatRange e1 e2) s
+            CDefault s _ -> recur Rust.PatDefault s
+            _ -> ([], stmt)
+            where
+                recur p s = let (ps, s') = extractPatterns s in (p:ps, s')
+
+        splitAtNextSwitchExit :: [CStat] -> ([CStat],[CStat])
+        splitAtNextSwitchExit [] = ([], [])
+        splitAtNextSwitchExit (x:xs) = case x of
+            CBreak _ -> ([], xs) -- remove the break since it's implicit in Rust
+            CCont _ -> ([x], xs) -- continue an enclosing loop
+            CReturn _ _ -> ([x], xs)
+            _ -> let (ys, zs) = splitAtNextSwitchExit xs in (x:ys, zs)
+```
+
+Once extracted, translating the arms is straightforward.
+We just have to remember to reject any `break` statements.
+(This restriction could be lifted by wrapping the whole thing in `loop { ... break; }`
+but that would break translating `continue` statements... Let's keep it simple for now.)
+
+```haskell
+        translateMatchArm :: ([Rust.SimplePattern CExpr], [CStat]) -> EnvMonad (Rust.Pat, Rust.Block)
+        translateMatchArm (cpats, cstmts) = do
+            pats <- traverse translatePattern cpats
+            let breakErrorMsg = "corrode can only handle top-level breaks in a switch"
+            mapExceptT (local (\ flow -> flow { onBreak = flip noTranslation breakErrorMsg })) $ do
+                stmts <- traverse interpretStatement cstmts
+                return (Rust.PatAlts pats, statementsToBlock (concat stmts))
+
+        -- This would just be "traverse (fmap result . interpretExpr True)"
+        -- if Rust.SimplePattern had a "Traversable" instance:
+        translatePattern :: Rust.SimplePattern CExpr -> EnvMonad (Rust.SimplePattern Rust.Expr)
+        translatePattern (Rust.PatExpr e) = fmap (Rust.PatExpr . result) (interpretExpr True e)
+        translatePattern (Rust.PatRange e1 e2) = liftM2 (\a b -> Rust.PatRange (result a) (result b))
+            (interpretExpr True e1) (interpretExpr True e2)
+        translatePattern Rust.PatDefault = return Rust.PatDefault
+
+        moveCatchAllToEnd :: [(Rust.Pat, Rust.Block)] -> [(Rust.Pat, Rust.Block)]
+        moveCatchAllToEnd cases = let (cs, ds) = partition containsNoDefault cases in cs ++ ds
+            where
+            containsNoDefault (Rust.PatAlts ps, _) =
+                all (\p -> case p of { Rust.PatDefault -> False; _ -> True }) ps
+```
+
+We produce a special error message for `case` or `default` labels encountered anywhere else.
+
+```haskell
+interpretStatement expr | isCaseLabel expr
+    = noTranslation expr "corrode can't handle case labels in complex switch statements"
+    where
+    isCaseLabel (CCase _ _ _) = True
+    isCaseLabel (CCases _ _ _ _) = True
+    isCaseLabel (CDefault _ _) = True
+    isCaseLabel _ = False
+```
+
 Otherwise, this is a type of statement we haven't implemented a
 translation for yet.
 

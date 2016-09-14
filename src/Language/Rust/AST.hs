@@ -153,6 +153,7 @@ data Expr
     | Member Expr Var
     | BlockExpr Block
     | UnsafeExpr Block
+    | Match Expr [(Pat, Block)]
     | IfThenElse Expr Block Block
     | Loop (Maybe Lifetime) Block
     | While (Maybe Lifetime) Expr Block
@@ -200,6 +201,23 @@ data Expr
     | Range Expr Expr
     | Assign Expr AssignOp Expr
 
+data SimplePattern a
+    = PatExpr a
+    | PatRange a a
+    | PatDefault
+
+newtype Pattern a = PatAlts [SimplePattern a]
+
+type Pat = Pattern Expr
+
+instance Pretty a => Pretty (SimplePattern a) where
+    pPrint (PatExpr expr) = pPrint expr
+    pPrint (PatRange from to) = pPrint from <+> text "..." <+> pPrint to
+    pPrint PatDefault = text "_"
+
+instance Pretty a => Pretty (Pattern a) where
+    pPrint (PatAlts ps) = foldr1 (\a b -> a <+> text "|" <+> b) $ map pPrint ps
+
 data AssignOp
     = (:=)
     | (:+=)
@@ -242,6 +260,10 @@ instance Pretty Expr where
         -- block expressions is excessive but correct.
         BlockExpr x -> text "(" <> pPrintBlock empty x <> text ")"
         UnsafeExpr x -> pPrintBlock (text "unsafe") x
+        Match e clauses -> text "match" <+> pPrint e <+> text "{" $+$
+            nest 4 (
+                vcat [pPrintBlock (pPrint pat <+> text "=>") block | (pat, block) <- clauses]
+            ) $+$ text "}"
         IfThenElse c t f -> pPrintBlock (text "if" <+> pPrint c) t <+> case f of
             Block [] Nothing -> empty
             Block [] (Just n@(IfThenElse{})) -> text "else" <+> pPrint n
